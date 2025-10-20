@@ -2,12 +2,12 @@
 # =========================================
 # Automated Postfix Mail Server Setup
 # Supports any SMTP (Gmail, Mailtrap, etc.)
-# Shows spinner + percentage during installation and service start
+# Spinner + percentage shown during install
 # =========================================
 # Usage:
 # sudo ./mail_server.sh <domain> <local_user> <relay_host:port> <relay_user> <relay_pass>
 
-set -e
+set -euo pipefail
 
 if [ "$EUID" -ne 0 ]; then
   echo "Please run as root"
@@ -25,43 +25,60 @@ RELAY_HOST="$3"
 RELAY_USER="$4"
 RELAY_PASS="$5"
 
-# --- Spinner + Percentage function ---
-spinner_with_percentage() {
-    local duration=$1
-    local message=$2
+# Detect distro
+if [ -f /etc/debian_version ]; then
+    DISTRO="debian"
+    PKG_INSTALL="apt-get install -y -qq"
+    UPDATE_CMD="apt-get update -y -qq"
+else
+    DISTRO="rhel"
+    PKG_INSTALL="yum install -y -q"
+    UPDATE_CMD="yum makecache -q"
+fi
+
+spinner() {
+    local pid=$1
+    local task="$2"
     local spin='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
     local i=0
     local percent=0
 
-    while [ $percent -le 100 ]; do
-        local temp=${spin:i++%${#spin}:1}
-        printf "\r%s  %s %3d%%" "$temp" "$message" "$percent"
-        sleep $(echo "$duration / 50" | bc -l)
-        ((percent+=2))
+    while kill -0 "$pid" 2>/dev/null; do
+        i=$(( (i+1) % 10 ))
+        percent=$((percent+1))
+        [[ $percent -gt 99 ]] && percent=99
+        printf "\r%s  %s... %d%%" "${spin:i:1}" "$task" "$percent"
+        sleep 0.1
     done
-    echo -e "\r✅  $message 100%"
+    printf "\r✅  %s... 100%%\n" "$task"
 }
 
-# --- Install Postfix if not present ---
-echo "[*] Installing Postfix if not present..."
+update_system() {
+    local task="Updating package index"
+    $UPDATE_CMD &
+    spinner $! "$task"
+}
+
+install_pkg() {
+    local pkg="$1"
+    local task="Installing $pkg"
+    $PKG_INSTALL "$pkg" &
+    spinner $! "$task"
+}
+
+echo "[*] Installing postfix if not present..."
 if ! dpkg -s postfix &>/dev/null && ! rpm -q postfix &>/dev/null; then
-    if [ -f /etc/debian_version ]; then
-        spinner_with_percentage 5 "Installing postfix & mailutils..." &
-        apt update &>/dev/null
-        DEBIAN_FRONTEND=noninteractive apt install -y postfix mailutils &>/dev/null
-        wait
+    install_pkg "postfix"
+    if [ "$DISTRO" = "debian" ]; then
+        install_pkg "mailutils"
     else
-        spinner_with_percentage 5 "Installing postfix & mailx..." &
-        yum install -y postfix mailx &>/dev/null
-        wait
+        install_pkg "mailx"
     fi
 fi
 
-# --- Add local user ---
 echo "[*] Adding local user '$LOCAL_USER'..."
 id "$LOCAL_USER" &>/dev/null || useradd -m "$LOCAL_USER"
 
-# --- Configure Postfix ---
 echo "[*] Configuring Postfix..."
 HOSTNAME="${RELAY_HOST%%:*}"
 PORT="${RELAY_HOST##*:}"
@@ -83,14 +100,13 @@ echo "$LOCAL_USER@$DOMAIN $RELAY_USER" > "$GENERIC_FILE"
 postmap "$GENERIC_FILE"
 postconf -e "smtp_generic_maps = hash:$GENERIC_FILE"
 
-# --- Enable and restart Postfix with spinner ---
+echo "[*] Enabling and starting Postfix..."
 systemctl enable postfix
-spinner_with_percentage 5 "Restarting Postfix service..." &
-systemctl restart postfix &>/dev/null
-wait
+systemctl restart postfix
+echo "✅  Postfix service started and enabled!"
+
+echo "[*] Sending test email..."
+echo "This is a test email from Postfix using $RELAY_USER" | mail -s "Test Email" "$RELAY_USER"
+echo "✅  Test email sent to $RELAY_USER. Check inbox (or spam folder)."
 
 echo "[*] Postfix configured successfully for $LOCAL_USER@$DOMAIN using $RELAY_HOST"
-
-# --- Send test email ---
-echo "This is a test email from Postfix using $RELAY_USER" | mail -s "Test Email" "$RELAY_USER"
-echo "[*] Test email sent to $RELAY_USER. Check inbox (or spam folder)."
